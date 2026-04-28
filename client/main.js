@@ -29,9 +29,10 @@ const MAX_FRAME_SECONDS = 0.05
 const INPUT_SEND_MS = 1000 / 60
 const REMOTE_SMOOTHING_RATE = 18
 const REMOTE_LEAD_SECONDS = 1 / 30
-const SELF_ACTIVE_CORRECTION_RATE = 8
-const SELF_IDLE_CORRECTION_RATE = 18
-const HARD_SNAP_DISTANCE = 120
+const SELF_ACTIVE_CORRECTION_RATE = 2.5
+const SELF_IDLE_CORRECTION_RATE = 20
+const SELF_MOVING_DRIFT_TOLERANCE = 24
+const HARD_SNAP_DISTANCE = 160
 
 const state = {
   socket: null,
@@ -307,6 +308,9 @@ function updatePredictedSelf(deltaSeconds) {
   if (distance > HARD_SNAP_DISTANCE) {
     state.selfPrediction.x = selfPlayer.targetX
     state.selfPrediction.y = selfPlayer.targetY
+  } else if (isMoving && distance <= SELF_MOVING_DRIFT_TOLERANCE) {
+    // While actively moving, prefer the local simulation unless we drift far enough
+    // that the correction would be visible as a meaningful mismatch anyway.
   } else {
     const correctionRate = isMoving ? SELF_ACTIVE_CORRECTION_RATE : SELF_IDLE_CORRECTION_RATE
     const correction = smoothingFactor(correctionRate, deltaSeconds)
