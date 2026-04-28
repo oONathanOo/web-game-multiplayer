@@ -26,12 +26,8 @@ const DEFAULT_WORLD = {
   playerRadius: PLAYER_RADIUS
 }
 const MAX_FRAME_SECONDS = 0.05
-const INPUT_SEND_MS = 1000 / 60
 const REMOTE_SMOOTHING_RATE = 18
 const REMOTE_LEAD_SECONDS = 1 / 30
-const SELF_ACTIVE_CORRECTION_RATE = 2.5
-const SELF_IDLE_CORRECTION_RATE = 20
-const SELF_MOVING_DRIFT_TOLERANCE = 24
 const HARD_SNAP_DISTANCE = 160
 
 const state = {
@@ -46,6 +42,10 @@ const state = {
   snapshot: null,
   renderPlayers: new Map(),
   selfPrediction: null,
+  pendingInputs: [],
+  lastAckedInput: { x: 0, y: 0 },
+  lastSentInput: null,
+  lastSnapshotAt: performance.now(),
   input: {
     left: false,
     right: false,
@@ -82,6 +82,10 @@ function smoothingFactor(rate, deltaSeconds) {
   return 1 - Math.exp(-rate * deltaSeconds)
 }
 
+function inputsEqual(left, right) {
+  return Boolean(left && right) && left.x === right.x && left.y === right.y
+}
+
 function currentWorld() {
   return state.snapshot?.world ?? DEFAULT_WORLD
 }
@@ -90,6 +94,11 @@ function clearSimulationState() {
   state.snapshot = null
   state.renderPlayers.clear()
   state.selfPrediction = null
+  state.pendingInputs = []
+  state.lastAckedInput = { x: 0, y: 0 }
+  state.lastSentInput = null
+  state.inputSequence = 0
+  state.lastSnapshotAt = performance.now()
   state.lastFrameAt = performance.now()
 }
 
@@ -271,7 +280,7 @@ function syncRenderPlayers(snapshot) {
   }
 }
 
-function updatePredictedSelf(deltaSeconds) {
+function rebasePredictedSelf(frameAt) {
   const selfPlayer = state.renderPlayers.get(state.playerId)
 
   if (!selfPlayer) {
@@ -287,40 +296,47 @@ function updatePredictedSelf(deltaSeconds) {
   }
 
   const world = currentWorld()
-  const input = directionalInput()
-  const isMoving = input.x !== 0 || input.y !== 0
+  let predictedX = selfPlayer.targetX
+  let predictedY = selfPlayer.targetY
+  let segmentStart = state.lastSnapshotAt
+  let activeInput = state.lastAckedInput
 
-  state.selfPrediction.x = clamp(
-    state.selfPrediction.x + input.x * PLAYER_SPEED * deltaSeconds,
-    world.playerRadius,
-    world.width - world.playerRadius
-  )
-  state.selfPrediction.y = clamp(
-    state.selfPrediction.y + input.y * PLAYER_SPEED * deltaSeconds,
-    world.playerRadius,
-    world.height - world.playerRadius
-  )
+  const applyInputForDuration = (input, durationSeconds) => {
+    if (durationSeconds <= 0) {
+      return
+    }
 
-  const errorX = selfPlayer.targetX - state.selfPrediction.x
-  const errorY = selfPlayer.targetY - state.selfPrediction.y
-  const distance = Math.hypot(errorX, errorY)
-
-  if (distance > HARD_SNAP_DISTANCE) {
-    state.selfPrediction.x = selfPlayer.targetX
-    state.selfPrediction.y = selfPlayer.targetY
-  } else if (isMoving && distance <= SELF_MOVING_DRIFT_TOLERANCE) {
-    // While actively moving, prefer the local simulation unless we drift far enough
-    // that the correction would be visible as a meaningful mismatch anyway.
-  } else {
-    const correctionRate = isMoving ? SELF_ACTIVE_CORRECTION_RATE : SELF_IDLE_CORRECTION_RATE
-    const correction = smoothingFactor(correctionRate, deltaSeconds)
-
-    state.selfPrediction.x += errorX * correction
-    state.selfPrediction.y += errorY * correction
+    predictedX = clamp(
+      predictedX + input.x * PLAYER_SPEED * durationSeconds,
+      world.playerRadius,
+      world.width - world.playerRadius
+    )
+    predictedY = clamp(
+      predictedY + input.y * PLAYER_SPEED * durationSeconds,
+      world.playerRadius,
+      world.height - world.playerRadius
+    )
   }
 
-  selfPlayer.x = state.selfPrediction.x
-  selfPlayer.y = state.selfPrediction.y
+  for (const pendingInput of state.pendingInputs) {
+    const segmentEnd = Math.min(frameAt, pendingInput.sentAt)
+    applyInputForDuration(activeInput, Math.max(0, segmentEnd - segmentStart) / 1000)
+    activeInput = pendingInput.input
+    segmentStart = Math.max(segmentStart, pendingInput.sentAt)
+  }
+
+  applyInputForDuration(activeInput, Math.max(0, frameAt - segmentStart) / 1000)
+
+  if (Math.hypot(predictedX - selfPlayer.x, predictedY - selfPlayer.y) > HARD_SNAP_DISTANCE) {
+    selfPlayer.x = predictedX
+    selfPlayer.y = predictedY
+  } else {
+    selfPlayer.x = predictedX
+    selfPlayer.y = predictedY
+  }
+
+  state.selfPrediction.x = predictedX
+  state.selfPrediction.y = predictedY
 }
 
 function updateRemotePlayers(deltaSeconds) {
@@ -360,7 +376,7 @@ function stepSimulation(deltaSeconds) {
   }
 
   updateRemotePlayers(deltaSeconds)
-  updatePredictedSelf(deltaSeconds)
+  rebasePredictedSelf(performance.now())
 }
 
 function renderWorld() {
@@ -481,17 +497,43 @@ function sendInput(force = false) {
 
   const input = directionalInput()
 
-  if (!force && input.x === 0 && input.y === 0) {
+  if (inputsEqual(input, state.lastSentInput)) {
     return
+  }
+
+  const pendingInput = {
+    sequence: state.inputSequence,
+    input,
+    sentAt: performance.now()
   }
 
   send({
     type: 'player:input',
-    sequence: state.inputSequence,
+    sequence: pendingInput.sequence,
     input
   })
 
+  state.pendingInputs.push(pendingInput)
+  state.lastSentInput = input
   state.inputSequence += 1
+}
+
+function applyServerAcknowledgement(acknowledgedSequence) {
+  if (!Number.isInteger(acknowledgedSequence)) {
+    return
+  }
+
+  let lastAcknowledgedInput = state.lastAckedInput
+
+  for (const pendingInput of state.pendingInputs) {
+    if (pendingInput.sequence <= acknowledgedSequence) {
+      lastAcknowledgedInput = pendingInput.input
+    }
+  }
+
+  state.lastAckedInput = lastAcknowledgedInput
+  state.pendingInputs = state.pendingInputs.filter((pendingInput) => pendingInput.sequence > acknowledgedSequence)
+  state.lastSnapshotAt = performance.now()
 }
 
 function scheduleReconnect() {
@@ -562,6 +604,7 @@ function connect() {
         updateStatus()
         roomCodeInput.value = message.roomId
         logHint(`Joined room ${message.roomId}.`)
+        sendInput(true)
         return
 
       case 'room:left':
@@ -586,6 +629,7 @@ function connect() {
       case 'game:snapshot':
         state.snapshot = message
         syncRenderPlayers(message)
+        applyServerAcknowledgement(message.acknowledgedSequence)
         tickStatusElement.textContent = String(message.tick)
         return
 
@@ -685,8 +729,6 @@ window.addEventListener('keyup', (event) => {
 })
 
 window.addEventListener('resize', resizeCanvas)
-
-setInterval(() => sendInput(false), INPUT_SEND_MS)
 
 if (initialRoomId) {
   logHint(`Invite link detected for room ${initialRoomId}. Connecting now...`)
