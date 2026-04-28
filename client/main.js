@@ -1,3 +1,4 @@
+import { PLAYER_RADIUS, PLAYER_SPEED, WORLD_HEIGHT, WORLD_WIDTH } from '/shared/constants.mjs'
 import { normalizeInput, normalizeRoomId, parseServerMessage, sanitizeNickname, stringifyMessage } from '/shared/protocol.mjs'
 
 const nicknameInput = document.querySelector('#nickname')
@@ -19,6 +20,18 @@ const inviteStatusElement = document.querySelector('#invite-status')
 const canvas = document.querySelector('#world')
 const context = canvas.getContext('2d')
 const initialRoomId = normalizeRoomId(new URL(window.location.href).searchParams.get('room'))
+const DEFAULT_WORLD = {
+  width: WORLD_WIDTH,
+  height: WORLD_HEIGHT,
+  playerRadius: PLAYER_RADIUS
+}
+const MAX_FRAME_SECONDS = 0.05
+const INPUT_SEND_MS = 1000 / 60
+const REMOTE_SMOOTHING_RATE = 18
+const REMOTE_LEAD_SECONDS = 1 / 30
+const SELF_ACTIVE_CORRECTION_RATE = 8
+const SELF_IDLE_CORRECTION_RATE = 18
+const HARD_SNAP_DISTANCE = 120
 
 const state = {
   socket: null,
@@ -30,6 +43,8 @@ const state = {
   room: null,
   rooms: [],
   snapshot: null,
+  renderPlayers: new Map(),
+  selfPrediction: null,
   input: {
     left: false,
     right: false,
@@ -37,7 +52,8 @@ const state = {
     down: false
   },
   inputSequence: 0,
-  reconnectTimeoutId: null
+  reconnectTimeoutId: null,
+  lastFrameAt: performance.now()
 }
 
 nicknameInput.value = state.nickname
@@ -55,6 +71,25 @@ function saveNickname() {
 
 function currentReady() {
   return Boolean(state.room?.players.find((player) => player.id === state.playerId)?.ready)
+}
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value))
+}
+
+function smoothingFactor(rate, deltaSeconds) {
+  return 1 - Math.exp(-rate * deltaSeconds)
+}
+
+function currentWorld() {
+  return state.snapshot?.world ?? DEFAULT_WORLD
+}
+
+function clearSimulationState() {
+  state.snapshot = null
+  state.renderPlayers.clear()
+  state.selfPrediction = null
+  state.lastFrameAt = performance.now()
 }
 
 function currentInviteUrl(roomId = state.roomId) {
@@ -177,6 +212,153 @@ function resizeCanvas() {
   context.setTransform(dpr, 0, 0, dpr, 0, 0)
 }
 
+function syncRenderPlayers(snapshot) {
+  const now = performance.now()
+  const seenPlayerIds = new Set()
+
+  for (const player of snapshot.players) {
+    const existing = state.renderPlayers.get(player.id)
+
+    if (existing) {
+      const elapsedSeconds = Math.max((now - existing.lastServerAt) / 1000, 1 / 120)
+      existing.velocityX = (player.x - existing.targetX) / elapsedSeconds
+      existing.velocityY = (player.y - existing.targetY) / elapsedSeconds
+      existing.targetX = player.x
+      existing.targetY = player.y
+      existing.nickname = player.nickname
+      existing.color = player.color
+      existing.ready = player.ready
+      existing.lastServerAt = now
+      existing.lastSequence = player.lastSequence ?? existing.lastSequence
+    } else {
+      state.renderPlayers.set(player.id, {
+        id: player.id,
+        nickname: player.nickname,
+        color: player.color,
+        ready: player.ready,
+        x: player.x,
+        y: player.y,
+        targetX: player.x,
+        targetY: player.y,
+        velocityX: 0,
+        velocityY: 0,
+        lastServerAt: now,
+        lastSequence: player.lastSequence ?? 0
+      })
+    }
+
+    seenPlayerIds.add(player.id)
+  }
+
+  for (const playerId of [...state.renderPlayers.keys()]) {
+    if (!seenPlayerIds.has(playerId)) {
+      state.renderPlayers.delete(playerId)
+    }
+  }
+
+  const selfPlayer = state.renderPlayers.get(state.playerId)
+
+  if (selfPlayer && !state.selfPrediction) {
+    state.selfPrediction = {
+      x: selfPlayer.targetX,
+      y: selfPlayer.targetY
+    }
+  }
+
+  if (!selfPlayer) {
+    state.selfPrediction = null
+  }
+}
+
+function updatePredictedSelf(deltaSeconds) {
+  const selfPlayer = state.renderPlayers.get(state.playerId)
+
+  if (!selfPlayer) {
+    state.selfPrediction = null
+    return
+  }
+
+  if (!state.selfPrediction) {
+    state.selfPrediction = {
+      x: selfPlayer.targetX,
+      y: selfPlayer.targetY
+    }
+  }
+
+  const world = currentWorld()
+  const input = directionalInput()
+  const isMoving = input.x !== 0 || input.y !== 0
+
+  state.selfPrediction.x = clamp(
+    state.selfPrediction.x + input.x * PLAYER_SPEED * deltaSeconds,
+    world.playerRadius,
+    world.width - world.playerRadius
+  )
+  state.selfPrediction.y = clamp(
+    state.selfPrediction.y + input.y * PLAYER_SPEED * deltaSeconds,
+    world.playerRadius,
+    world.height - world.playerRadius
+  )
+
+  const errorX = selfPlayer.targetX - state.selfPrediction.x
+  const errorY = selfPlayer.targetY - state.selfPrediction.y
+  const distance = Math.hypot(errorX, errorY)
+
+  if (distance > HARD_SNAP_DISTANCE) {
+    state.selfPrediction.x = selfPlayer.targetX
+    state.selfPrediction.y = selfPlayer.targetY
+  } else {
+    const correctionRate = isMoving ? SELF_ACTIVE_CORRECTION_RATE : SELF_IDLE_CORRECTION_RATE
+    const correction = smoothingFactor(correctionRate, deltaSeconds)
+
+    state.selfPrediction.x += errorX * correction
+    state.selfPrediction.y += errorY * correction
+  }
+
+  selfPlayer.x = state.selfPrediction.x
+  selfPlayer.y = state.selfPrediction.y
+}
+
+function updateRemotePlayers(deltaSeconds) {
+  const world = currentWorld()
+  const blend = smoothingFactor(REMOTE_SMOOTHING_RATE, deltaSeconds)
+
+  for (const player of state.renderPlayers.values()) {
+    if (player.id === state.playerId && state.selfPrediction) {
+      continue
+    }
+
+    const projectedTargetX = clamp(
+      player.targetX + player.velocityX * REMOTE_LEAD_SECONDS,
+      world.playerRadius,
+      world.width - world.playerRadius
+    )
+    const projectedTargetY = clamp(
+      player.targetY + player.velocityY * REMOTE_LEAD_SECONDS,
+      world.playerRadius,
+      world.height - world.playerRadius
+    )
+
+    if (Math.hypot(projectedTargetX - player.x, projectedTargetY - player.y) > HARD_SNAP_DISTANCE) {
+      player.x = projectedTargetX
+      player.y = projectedTargetY
+      continue
+    }
+
+    player.x += (projectedTargetX - player.x) * blend
+    player.y += (projectedTargetY - player.y) * blend
+  }
+}
+
+function stepSimulation(deltaSeconds) {
+  if (!state.snapshot) {
+    return
+  }
+
+  updateRemotePlayers(deltaSeconds)
+  updatePredictedSelf(deltaSeconds)
+}
+
 function renderWorld() {
   const width = canvas.clientWidth
   const height = canvas.clientHeight
@@ -223,7 +405,7 @@ function renderWorld() {
   context.lineWidth = 4 / scale
   context.strokeRect(0, 0, snapshot.world.width, snapshot.world.height)
 
-  for (const player of snapshot.players) {
+  for (const player of state.renderPlayers.values()) {
     const isSelf = player.id === state.playerId
 
     context.beginPath()
@@ -246,7 +428,10 @@ function renderWorld() {
   context.restore()
 }
 
-function loop() {
+function loop(frameAt) {
+  const deltaSeconds = Math.min((frameAt - state.lastFrameAt) / 1000, MAX_FRAME_SECONDS)
+  state.lastFrameAt = frameAt
+  stepSimulation(deltaSeconds)
   renderWorld()
   requestAnimationFrame(loop)
 }
@@ -366,6 +551,7 @@ function connect() {
         return
 
       case 'room:joined':
+        clearSimulationState()
         state.roomId = message.roomId
         state.desiredRoomId = message.roomId
         syncRoomUrl(message.roomId)
@@ -378,7 +564,7 @@ function connect() {
         state.roomId = null
         state.desiredRoomId = null
         state.room = null
-        state.snapshot = null
+        clearSimulationState()
         syncRoomUrl(null)
         renderRoster()
         updateStatus()
@@ -395,6 +581,7 @@ function connect() {
 
       case 'game:snapshot':
         state.snapshot = message
+        syncRenderPlayers(message)
         tickStatusElement.textContent = String(message.tick)
         return
 
@@ -495,7 +682,7 @@ window.addEventListener('keyup', (event) => {
 
 window.addEventListener('resize', resizeCanvas)
 
-setInterval(() => sendInput(false), 1000 / 30)
+setInterval(() => sendInput(false), INPUT_SEND_MS)
 
 if (initialRoomId) {
   logHint(`Invite link detected for room ${initialRoomId}. Connecting now...`)
@@ -505,5 +692,5 @@ resizeCanvas()
 renderRoomList()
 renderRoster()
 updateStatus()
-loop()
+requestAnimationFrame(loop)
 connect()

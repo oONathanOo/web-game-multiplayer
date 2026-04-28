@@ -1,5 +1,5 @@
 export const NETWORK_VERSION = 1
-export const TICK_RATE = 20
+export const TICK_RATE = 30
 export const TICK_MS = 1000 / TICK_RATE
 export const WORLD_WIDTH = 1280
 export const WORLD_HEIGHT = 720
