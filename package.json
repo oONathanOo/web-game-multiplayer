@@ -1,0 +1,13 @@
+{
+  "name": "web-game-multiplayer-starter",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "node --watch server/index.mjs",
+    "start": "node server/index.mjs",
+    "test": "node --test"
+  }
+}

@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Multiplayer Sandbox</title>
+    <link rel="stylesheet" href="/client/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <aside class="control-panel">
+        <div class="panel-card brand-card">
+          <p class="eyebrow">Multiplayer Starter</p>
+          <h1>Authoritative Sandbox</h1>
+          <p class="lede">
+            Rooms, realtime sync, fixed-tick simulation, and input handling are ready before we lock in the
+            actual game.
+          </p>
+        </div>
+
+        <div class="panel-card">
+          <label class="field">
+            <span>Nickname</span>
+            <input id="nickname" maxlength="18" placeholder="Pilot name" />
+          </label>
+
+          <div class="button-row">
+            <button id="create-room" class="primary">Create Room</button>
+            <button id="leave-room" class="ghost">Leave</button>
+          </div>
+
+          <label class="field">
+            <span>Room Code</span>
+            <input id="room-code" maxlength="4" placeholder="ABCD" />
+          </label>
+
+          <div class="button-row">
+            <button id="join-room" class="secondary">Join Room</button>
+            <button id="toggle-ready" class="ghost">Toggle Ready</button>
+          </div>
+
+          <div class="invite-block">
+            <div id="invite-status" class="invite-status">Join or create a room to generate an invite link.</div>
+            <button id="copy-invite" class="primary invite-button">Copy Invite Link</button>
+          </div>
+        </div>
+
+        <div class="panel-card">
+          <div class="section-head">
+            <h2>Open Rooms</h2>
+            <span id="room-count" class="pill">0</span>
+          </div>
+          <div id="room-list" class="room-list empty-state">No rooms yet. Create the first one.</div>
+        </div>
+
+        <div class="panel-card">
+          <div class="section-head">
+            <h2>Roster</h2>
+            <span id="current-room-label" class="pill neutral">No Room</span>
+          </div>
+          <div id="roster" class="roster empty-state">Join a room to see connected players.</div>
+        </div>
+      </aside>
+
+      <section class="stage-panel">
+        <div class="panel-card stage-header">
+          <div>
+            <p class="eyebrow">Live State</p>
+            <h2>Realtime Arena Preview</h2>
+          </div>
+
+          <div class="status-cluster">
+            <div class="status-chip">
+              <span>Connection</span>
+              <strong id="connection-status">Connecting</strong>
+            </div>
+            <div class="status-chip">
+              <span>Tick</span>
+              <strong id="tick-status">0</strong>
+            </div>
+            <div class="status-chip">
+              <span>Player</span>
+              <strong id="player-status">Pending</strong>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel-card canvas-card">
+          <canvas id="world"></canvas>
+          <div class="canvas-overlay">
+            <p id="hint-text">Use WASD or arrow keys after joining a room.</p>
+          </div>
+        </div>
+
+        <div class="panel-card tips-card">
+          <p class="eyebrow">What’s Ready</p>
+          <ul class="tips-list">
+            <li>Shared message protocol between browser and server</li>
+            <li>Room codes and lobby discovery</li>
+            <li>Authoritative movement and server snapshots</li>
+            <li>Ready flags for future pre-match flow</li>
+          </ul>
+        </div>
+      </section>
+    </main>
+
+    <script type="module" src="/client/main.js"></script>
+  </body>
+</html>
