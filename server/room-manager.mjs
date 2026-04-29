@@ -1,38 +1,6 @@
-import {
-  MAX_PLAYERS_PER_ROOM,
-  PLAYER_COLORS,
-  PLAYER_RADIUS,
-  PLAYER_SPEED,
-  WORLD_HEIGHT,
-  WORLD_WIDTH
-} from '../shared/constants.mjs'
-import { createRoomId, normalizeInput, normalizeRoomId, sanitizeNickname } from '../shared/protocol.mjs'
-
-function clamp(value, min, max) {
-  return Math.min(max, Math.max(min, value))
-}
-
-function createSpawnPoint(playerIndex) {
-  const centerX = WORLD_WIDTH / 2
-  const centerY = WORLD_HEIGHT / 2
-  const radius = 180
-  const angle = (Math.PI * 2 * playerIndex) / Math.max(MAX_PLAYERS_PER_ROOM, 1)
-
-  return {
-    x: centerX + Math.cos(angle) * radius,
-    y: centerY + Math.sin(angle) * radius
-  }
-}
-
-function roomRoster(room) {
-  return [...room.players.values()].map((player) => ({
-    id: player.id,
-    nickname: player.nickname,
-    color: player.color,
-    ready: player.ready,
-    connected: true
-  }))
-}
+import { MAX_PLAYERS_PER_ROOM } from '../shared/constants.mjs'
+import { buildRoomSnapshot, buildRoomState, createRoomGameState, createSpawnPoint, initializePlayerGameState, roomAllowsJoin, selectUpgradeForPlayer, tickRoomGame } from '../shared/game-sim.mjs'
+import { createRoomId, normalizeRoomId, sanitizeNickname } from '../shared/protocol.mjs'
 
 export function createRoomManager(options = {}) {
   const now = options.now ?? (() => Date.now())
@@ -58,19 +26,18 @@ export function createRoomManager(options = {}) {
 
   function buildPlayer(playerId, nickname, room) {
     const rosterIndex = room.players.size
-    const spawn = createSpawnPoint(rosterIndex)
-
-    return {
+    const spawn = createSpawnPoint(rosterIndex, Math.max(room.maxPlayers, 1))
+    const player = {
       id: playerId,
       nickname: sanitizeNickname(nickname),
-      color: PLAYER_COLORS[rosterIndex % PLAYER_COLORS.length],
       ready: false,
-      input: { x: 0, y: 0 },
       lastSequence: 0,
-      x: clamp(spawn.x, PLAYER_RADIUS, WORLD_WIDTH - PLAYER_RADIUS),
-      y: clamp(spawn.y, PLAYER_RADIUS, WORLD_HEIGHT - PLAYER_RADIUS),
-      joinedAt: now()
+      joinedAt: now(),
+      color: room.palette[rosterIndex % room.palette.length]
     }
+
+    initializePlayerGameState(player, spawn)
+    return player
   }
 
   function deleteRoomIfEmpty(roomId) {
@@ -123,8 +90,12 @@ export function createRoomManager(options = {}) {
       createdAt,
       tick: 0,
       maxPlayers: MAX_PLAYERS_PER_ROOM,
-      players: new Map()
+      palette: ['#f97316', '#10b981', '#2563eb', '#eab308', '#a855f7', '#ef4444', '#0ea5e9', '#84cc16'],
+      players: new Map(),
+      game: null
     }
+
+    room.game = createRoomGameState(room.seed)
 
     rooms.set(roomId, room)
 
@@ -158,6 +129,14 @@ export function createRoomManager(options = {}) {
         ok: false,
         code: 'room_not_found',
         message: 'That room does not exist yet.'
+      }
+    }
+
+    if (!roomAllowsJoin(room)) {
+      return {
+        ok: false,
+        code: 'match_in_progress',
+        message: 'That room is already in the middle of a run.'
       }
     }
 
@@ -205,9 +184,33 @@ export function createRoomManager(options = {}) {
       return false
     }
 
-    player.input = normalizeInput(input)
+    player.input = input?.move
+      ? {
+          ...player.input,
+          ...input
+        }
+      : {
+          ...player.input,
+          move: input
+        }
     player.lastSequence = Number.isInteger(sequence) ? sequence : player.lastSequence
     return true
+  }
+
+  function selectUpgrade(playerId, upgradeId) {
+    const roomId = playerRoomIndex.get(playerId)
+
+    if (!roomId) {
+      return false
+    }
+
+    const room = rooms.get(roomId)
+
+    if (!room) {
+      return false
+    }
+
+    return selectUpgradeForPlayer(room, playerId, upgradeId)
   }
 
   function setPlayerReady(playerId, ready) {
@@ -234,47 +237,12 @@ export function createRoomManager(options = {}) {
 
   function getRoomState(roomId) {
     const room = rooms.get(roomId)
-
-    if (!room) {
-      return null
-    }
-
-    return {
-      roomId: room.roomId,
-      createdAt: room.createdAt,
-      seed: room.seed,
-      tick: room.tick,
-      maxPlayers: room.maxPlayers,
-      playerCount: room.players.size,
-      players: roomRoster(room)
-    }
+    return room ? buildRoomState(room) : null
   }
 
   function getRoomSnapshot(roomId) {
     const room = rooms.get(roomId)
-
-    if (!room) {
-      return null
-    }
-
-    return {
-      roomId: room.roomId,
-      tick: room.tick,
-      world: {
-        width: WORLD_WIDTH,
-        height: WORLD_HEIGHT,
-        playerRadius: PLAYER_RADIUS
-      },
-      players: [...room.players.values()].map((player) => ({
-        id: player.id,
-        nickname: player.nickname,
-        color: player.color,
-        ready: player.ready,
-        x: Number(player.x.toFixed(2)),
-        y: Number(player.y.toFixed(2)),
-        lastSequence: player.lastSequence
-      }))
-    }
+    return room ? buildRoomSnapshot(room) : null
   }
 
   function getRoomSummaries() {
@@ -284,7 +252,8 @@ export function createRoomManager(options = {}) {
         createdAt: room.createdAt,
         playerCount: room.players.size,
         maxPlayers: room.maxPlayers,
-        openSlots: room.maxPlayers - room.players.size
+        openSlots: room.maxPlayers - room.players.size,
+        phase: room.game.phase
       }))
       .sort((left, right) => left.roomId.localeCompare(right.roomId))
   }
@@ -294,23 +263,9 @@ export function createRoomManager(options = {}) {
   }
 
   function tick(deltaMs) {
-    const deltaSeconds = Math.max(0, Math.min(deltaMs, 250)) / 1000
-
     for (const room of rooms.values()) {
       room.tick += 1
-
-      for (const player of room.players.values()) {
-        player.x = clamp(
-          player.x + player.input.x * PLAYER_SPEED * deltaSeconds,
-          PLAYER_RADIUS,
-          WORLD_WIDTH - PLAYER_RADIUS
-        )
-        player.y = clamp(
-          player.y + player.input.y * PLAYER_SPEED * deltaSeconds,
-          PLAYER_RADIUS,
-          WORLD_HEIGHT - PLAYER_RADIUS
-        )
-      }
+      tickRoomGame(room, Math.max(0, Math.min(deltaMs, 250)), randomValue)
     }
   }
 
@@ -320,6 +275,7 @@ export function createRoomManager(options = {}) {
     leaveRoom,
     handleDisconnect,
     updatePlayerInput,
+    selectUpgrade,
     setPlayerReady,
     getRoomIdForPlayer,
     getRoomState,

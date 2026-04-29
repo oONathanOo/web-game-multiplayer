@@ -1,118 +1,165 @@
-import { PLAYER_RADIUS, PLAYER_SPEED, WORLD_HEIGHT, WORLD_WIDTH } from '/shared/constants.mjs'
-import { normalizeInput, normalizeRoomId, parseServerMessage, sanitizeNickname, stringifyMessage } from '/shared/protocol.mjs'
+import { GAME_META, RELIC_STATE, UPGRADE_DEFS } from '../shared/game-data.mjs'
+import { normalizeInput, normalizeRoomId, sanitizeNickname } from '../shared/protocol.mjs'
+import { createNetworkClient } from './network-client.mjs'
+import { createArenaRenderer } from './render-game.mjs'
 
-const nicknameInput = document.querySelector('#nickname')
-const roomCodeInput = document.querySelector('#room-code')
-const createRoomButton = document.querySelector('#create-room')
-const joinRoomButton = document.querySelector('#join-room')
-const leaveRoomButton = document.querySelector('#leave-room')
-const toggleReadyButton = document.querySelector('#toggle-ready')
-const copyInviteButton = document.querySelector('#copy-invite')
-const roomListElement = document.querySelector('#room-list')
-const rosterElement = document.querySelector('#roster')
-const roomCountElement = document.querySelector('#room-count')
-const currentRoomLabel = document.querySelector('#current-room-label')
-const connectionStatusElement = document.querySelector('#connection-status')
-const tickStatusElement = document.querySelector('#tick-status')
-const playerStatusElement = document.querySelector('#player-status')
-const hintTextElement = document.querySelector('#hint-text')
-const inviteStatusElement = document.querySelector('#invite-status')
-const canvas = document.querySelector('#world')
-const context = canvas.getContext('2d')
-const initialRoomId = normalizeRoomId(new URL(window.location.href).searchParams.get('room'))
-const DEFAULT_WORLD = {
-  width: WORLD_WIDTH,
-  height: WORLD_HEIGHT,
-  playerRadius: PLAYER_RADIUS
-}
-const MAX_FRAME_SECONDS = 0.05
-const REMOTE_SMOOTHING_RATE = 18
-const REMOTE_LEAD_SECONDS = 1 / 30
-const HARD_SNAP_DISTANCE = 160
+const NICKNAME_KEY = 'sunshard-siege-nickname'
+
+const canvas = document.querySelector('#game-canvas')
+const nicknameInput = document.querySelector('#nickname-input')
+const roomCodeInput = document.querySelector('#room-code-input')
+const createRoomButton = document.querySelector('#create-room-button')
+const joinRoomButton = document.querySelector('#join-room-button')
+const readyButton = document.querySelector('#ready-button')
+const leaveRoomButton = document.querySelector('#leave-room-button')
+const copyInviteButton = document.querySelector('#copy-invite-button')
+const connectionBadge = document.querySelector('#connection-badge')
+const statusLine = document.querySelector('#status-line')
+const sessionPanel = document.querySelector('#session-panel')
+const rosterPanel = document.querySelector('#roster-panel')
+const infoPanel = document.querySelector('#info-panel')
+const abilityBar = document.querySelector('#ability-bar')
+const hudTop = document.querySelector('#hud-top')
+const upgradeOverlay = document.querySelector('#upgrade-overlay')
+const phaseOverlay = document.querySelector('#phase-overlay')
+
+const renderer = createArenaRenderer(canvas)
+const network = createNetworkClient({
+  open: () => {
+    state.connection = 'online'
+    state.notice = 'Connected to the shrine network.'
+    renderStaticUi()
+  },
+  close: () => {
+    state.connection = 'offline'
+    state.notice = 'Connection lost. Reconnecting...'
+    state.snapshot = null
+    renderStaticUi()
+    window.setTimeout(() => network.connect(), 1200)
+  },
+  error: () => {
+    state.notice = 'The shrine connection hit turbulence.'
+    renderStaticUi()
+  },
+  protocolError: (error) => {
+    state.notice = error
+    renderStaticUi()
+  },
+  message: handleServerMessage
+})
 
 const state = {
-  socket: null,
-  connected: false,
-  playerId: null,
-  nickname: localStorage.getItem('multiplayer-nickname') ?? 'Pilot',
-  roomId: null,
-  desiredRoomId: initialRoomId,
-  room: null,
-  rooms: [],
+  connection: 'connecting',
+  selfId: null,
+  currentRoomId: null,
+  roomState: null,
+  roomList: [],
   snapshot: null,
-  renderPlayers: new Map(),
-  selfPrediction: null,
-  pendingInputs: [],
-  lastAckedInput: { x: 0, y: 0 },
-  lastSentInput: null,
-  lastSnapshotAt: performance.now(),
-  input: {
-    left: false,
-    right: false,
-    up: false,
-    down: false
-  },
+  notice: 'Awakening shrine relay...',
   inputSequence: 0,
-  reconnectTimeoutId: null,
-  lastFrameAt: performance.now()
+  lastInputSendAt: 0,
+  localInput: {
+    move: { x: 0, y: 0 },
+    aim: { x: 1, y: 0 },
+    fire: false,
+    dash: false,
+    beacon: false,
+    nova: false,
+    deploy: false
+  },
+  keys: new Set(),
+  pendingRoomFromUrl: normalizeRoomId(new URLSearchParams(window.location.search).get('room'))
 }
 
-nicknameInput.value = state.nickname
-roomCodeInput.value = initialRoomId ?? ''
+const ABILITIES = [
+  {
+    key: 'Mouse',
+    name: 'Sun Bolt',
+    description: 'Hold to fire rapid shots.',
+    cooldownField: 'fireCooldownMs',
+    instant: true
+  },
+  {
+    key: 'Space',
+    name: 'Ash Dash',
+    description: 'Dash and supercharge the relic tether.',
+    cooldownField: 'dashCooldownMs'
+  },
+  {
+    key: 'E',
+    name: 'Relay Beacon',
+    description: 'Drop a temporary anchor to redirect your tether.',
+    cooldownField: 'beaconCooldownMs'
+  },
+  {
+    key: 'Q',
+    name: 'Star Nova',
+    description: 'Blast nearby foes and pull in motes.',
+    cooldownField: 'novaCooldownMs'
+  },
+  {
+    key: 'R',
+    name: 'Sun Spire',
+    description: 'Plant an autonomous defense ahead of your aim.',
+    cooldownField: 'defenseCooldownMs'
+  }
+]
 
-function logHint(message) {
-  hintTextElement.textContent = message
+function nickname() {
+  return sanitizeNickname(nicknameInput.value)
 }
 
 function saveNickname() {
-  state.nickname = sanitizeNickname(nicknameInput.value)
-  nicknameInput.value = state.nickname
-  localStorage.setItem('multiplayer-nickname', state.nickname)
+  const cleaned = nickname()
+  nicknameInput.value = cleaned
+  localStorage.setItem(NICKNAME_KEY, cleaned)
 }
 
-function currentReady() {
-  return Boolean(state.room?.players.find((player) => player.id === state.playerId)?.ready)
+function currentPlayer() {
+  return state.snapshot?.players.find((player) => player.id === state.selfId) ?? null
 }
 
-function clamp(value, min, max) {
-  return Math.min(max, Math.max(min, value))
+function currentPhase() {
+  return state.snapshot?.world.phase ?? state.roomState?.phase ?? 'lobby'
 }
 
-function smoothingFactor(rate, deltaSeconds) {
-  return 1 - Math.exp(-rate * deltaSeconds)
+function livingPlayerCount(players) {
+  return players.filter((player) => player.alive !== false).length
 }
 
-function inputsEqual(left, right) {
-  return Boolean(left && right) && left.x === right.x && left.y === right.y
-}
+function refreshAmbientNotice() {
+  const world = state.snapshot?.world
 
-function currentWorld() {
-  return state.snapshot?.world ?? DEFAULT_WORLD
-}
-
-function clearSimulationState() {
-  state.snapshot = null
-  state.renderPlayers.clear()
-  state.selfPrediction = null
-  state.pendingInputs = []
-  state.lastAckedInput = { x: 0, y: 0 }
-  state.lastSentInput = null
-  state.inputSequence = 0
-  state.lastSnapshotAt = performance.now()
-  state.lastFrameAt = performance.now()
-}
-
-function currentInviteUrl(roomId = state.roomId) {
-  if (!roomId) {
-    return null
+  if (world?.phase === 'countdown') {
+    state.notice = world.eventText || 'The shrine awakens...'
+    return
   }
 
-  const url = new URL(window.location.href)
-  url.searchParams.set('room', roomId)
-  return url.toString()
+  if (world?.phase === 'intermission') {
+    state.notice = world.eventText || 'Choose a blessing before the next wave.'
+    return
+  }
+
+  if (world?.phase === 'playing') {
+    const remaining = world.wave?.remainingSpawns ?? 0
+    state.notice = `${world.wave?.name ?? 'Wave live'} • ${remaining} spawns still queued`
+    return
+  }
+
+  if (world?.phase === 'victory' || world?.phase === 'defeat') {
+    state.notice = world.eventText || state.notice
+    return
+  }
+
+  if (state.roomState) {
+    state.notice = 'Room open. Invite allies or launch a solo defense.'
+    return
+  }
+
+  state.notice = 'Connected to the shrine network.'
 }
 
-function syncRoomUrl(roomId) {
+function updateUrlRoom(roomId) {
   const url = new URL(window.location.href)
 
   if (roomId) {
@@ -121,622 +168,687 @@ function syncRoomUrl(roomId) {
     url.searchParams.delete('room')
   }
 
-  window.history.replaceState({}, '', `${url.pathname}${url.search}${url.hash}`)
+  history.replaceState({}, '', url)
 }
 
-function updateInviteUi() {
-  const inviteUrl = currentInviteUrl()
-  copyInviteButton.disabled = !inviteUrl
-  inviteStatusElement.textContent = inviteUrl ?? 'Join or create a room to generate an invite link.'
+function inviteLink(roomId) {
+  const url = new URL(window.location.href)
+  url.searchParams.set('room', roomId)
+  return url.toString()
 }
 
-function updateButtons() {
-  const inRoom = Boolean(state.roomId)
-
-  createRoomButton.disabled = !state.connected
-  joinRoomButton.disabled = !state.connected
-  leaveRoomButton.disabled = !state.connected || !inRoom
-  toggleReadyButton.disabled = !state.connected || !inRoom
-  toggleReadyButton.textContent = currentReady() ? 'Ready: On' : 'Ready: Off'
-}
-
-function updateStatus() {
-  connectionStatusElement.textContent = state.connected ? 'Connected' : 'Reconnecting'
-  playerStatusElement.textContent = state.playerId ? state.playerId.slice(0, 8) : 'Pending'
-  tickStatusElement.textContent = String(state.snapshot?.tick ?? state.room?.tick ?? 0)
-  currentRoomLabel.textContent = state.roomId ?? 'No Room'
-  currentRoomLabel.classList.toggle('neutral', !state.roomId)
-  updateButtons()
-  updateInviteUi()
-}
-
-function renderRoomList() {
-  roomCountElement.textContent = String(state.rooms.length)
-
-  if (state.rooms.length === 0) {
-    roomListElement.className = 'room-list empty-state'
-    roomListElement.textContent = 'No rooms yet. Create the first one.'
+function setConnectionBadge() {
+  if (!connectionBadge) {
     return
   }
 
-  roomListElement.className = 'room-list'
-  roomListElement.replaceChildren(
-    ...state.rooms.map((room) => {
-      const wrapper = document.createElement('div')
-      wrapper.className = 'room-entry'
-
-      const title = document.createElement('strong')
-      title.textContent = room.roomId
-
-      const meta = document.createElement('div')
-      meta.className = 'room-meta'
-      meta.textContent = `${room.playerCount}/${room.maxPlayers} players`
-
-      const joinButton = document.createElement('button')
-      joinButton.className = 'secondary'
-      joinButton.textContent = 'Join'
-      joinButton.disabled = !state.connected
-      joinButton.addEventListener('click', () => {
-        roomCodeInput.value = room.roomId
-        joinRoom(room.roomId)
-      })
-
-      wrapper.append(title, meta, joinButton)
-      return wrapper
-    })
-  )
-}
-
-function renderRoster() {
-  if (!state.room) {
-    rosterElement.className = 'roster empty-state'
-    rosterElement.textContent = 'Join a room to see connected players.'
-    return
-  }
-
-  rosterElement.className = 'roster'
-  rosterElement.replaceChildren(
-    ...state.room.players.map((player) => {
-      const entry = document.createElement('div')
-      entry.className = 'roster-entry'
-
-      const name = document.createElement('strong')
-      name.textContent = player.id === state.playerId ? `${player.nickname} (You)` : player.nickname
-      name.style.color = player.color
-
-      const meta = document.createElement('div')
-      meta.className = 'roster-meta'
-      meta.textContent = `${player.id.slice(0, 8)} • ${player.ready ? 'Ready' : 'Not ready'}`
-
-      entry.append(name, meta)
-      return entry
-    })
-  )
-}
-
-function resizeCanvas() {
-  const bounds = canvas.getBoundingClientRect()
-  const dpr = window.devicePixelRatio || 1
-  canvas.width = Math.floor(bounds.width * dpr)
-  canvas.height = Math.floor(bounds.height * dpr)
-  context.setTransform(dpr, 0, 0, dpr, 0, 0)
-}
-
-function syncRenderPlayers(snapshot) {
-  const now = performance.now()
-  const seenPlayerIds = new Set()
-
-  for (const player of snapshot.players) {
-    const existing = state.renderPlayers.get(player.id)
-
-    if (existing) {
-      const elapsedSeconds = Math.max((now - existing.lastServerAt) / 1000, 1 / 120)
-      existing.velocityX = (player.x - existing.targetX) / elapsedSeconds
-      existing.velocityY = (player.y - existing.targetY) / elapsedSeconds
-      existing.targetX = player.x
-      existing.targetY = player.y
-      existing.nickname = player.nickname
-      existing.color = player.color
-      existing.ready = player.ready
-      existing.lastServerAt = now
-      existing.lastSequence = player.lastSequence ?? existing.lastSequence
-    } else {
-      state.renderPlayers.set(player.id, {
-        id: player.id,
-        nickname: player.nickname,
-        color: player.color,
-        ready: player.ready,
-        x: player.x,
-        y: player.y,
-        targetX: player.x,
-        targetY: player.y,
-        velocityX: 0,
-        velocityY: 0,
-        lastServerAt: now,
-        lastSequence: player.lastSequence ?? 0
-      })
-    }
-
-    seenPlayerIds.add(player.id)
-  }
-
-  for (const playerId of [...state.renderPlayers.keys()]) {
-    if (!seenPlayerIds.has(playerId)) {
-      state.renderPlayers.delete(playerId)
-    }
-  }
-
-  const selfPlayer = state.renderPlayers.get(state.playerId)
-
-  if (selfPlayer && !state.selfPrediction) {
-    state.selfPrediction = {
-      x: selfPlayer.targetX,
-      y: selfPlayer.targetY
-    }
-  }
-
-  if (!selfPlayer) {
-    state.selfPrediction = null
-  }
-}
-
-function rebasePredictedSelf(frameAt) {
-  const selfPlayer = state.renderPlayers.get(state.playerId)
-
-  if (!selfPlayer) {
-    state.selfPrediction = null
-    return
-  }
-
-  if (!state.selfPrediction) {
-    state.selfPrediction = {
-      x: selfPlayer.targetX,
-      y: selfPlayer.targetY
-    }
-  }
-
-  const world = currentWorld()
-  let predictedX = selfPlayer.targetX
-  let predictedY = selfPlayer.targetY
-  let segmentStart = state.lastSnapshotAt
-  let activeInput = state.lastAckedInput
-
-  const applyInputForDuration = (input, durationSeconds) => {
-    if (durationSeconds <= 0) {
-      return
-    }
-
-    predictedX = clamp(
-      predictedX + input.x * PLAYER_SPEED * durationSeconds,
-      world.playerRadius,
-      world.width - world.playerRadius
-    )
-    predictedY = clamp(
-      predictedY + input.y * PLAYER_SPEED * durationSeconds,
-      world.playerRadius,
-      world.height - world.playerRadius
-    )
-  }
-
-  for (const pendingInput of state.pendingInputs) {
-    const segmentEnd = Math.min(frameAt, pendingInput.sentAt)
-    applyInputForDuration(activeInput, Math.max(0, segmentEnd - segmentStart) / 1000)
-    activeInput = pendingInput.input
-    segmentStart = Math.max(segmentStart, pendingInput.sentAt)
-  }
-
-  applyInputForDuration(activeInput, Math.max(0, frameAt - segmentStart) / 1000)
-
-  if (Math.hypot(predictedX - selfPlayer.x, predictedY - selfPlayer.y) > HARD_SNAP_DISTANCE) {
-    selfPlayer.x = predictedX
-    selfPlayer.y = predictedY
-  } else {
-    selfPlayer.x = predictedX
-    selfPlayer.y = predictedY
-  }
-
-  state.selfPrediction.x = predictedX
-  state.selfPrediction.y = predictedY
-}
-
-function updateRemotePlayers(deltaSeconds) {
-  const world = currentWorld()
-  const blend = smoothingFactor(REMOTE_SMOOTHING_RATE, deltaSeconds)
-
-  for (const player of state.renderPlayers.values()) {
-    if (player.id === state.playerId && state.selfPrediction) {
-      continue
-    }
-
-    const projectedTargetX = clamp(
-      player.targetX + player.velocityX * REMOTE_LEAD_SECONDS,
-      world.playerRadius,
-      world.width - world.playerRadius
-    )
-    const projectedTargetY = clamp(
-      player.targetY + player.velocityY * REMOTE_LEAD_SECONDS,
-      world.playerRadius,
-      world.height - world.playerRadius
-    )
-
-    if (Math.hypot(projectedTargetX - player.x, projectedTargetY - player.y) > HARD_SNAP_DISTANCE) {
-      player.x = projectedTargetX
-      player.y = projectedTargetY
-      continue
-    }
-
-    player.x += (projectedTargetX - player.x) * blend
-    player.y += (projectedTargetY - player.y) * blend
-  }
-}
-
-function stepSimulation(deltaSeconds) {
-  if (!state.snapshot) {
-    return
-  }
-
-  updateRemotePlayers(deltaSeconds)
-  rebasePredictedSelf(performance.now())
-}
-
-function renderWorld() {
-  const width = canvas.clientWidth
-  const height = canvas.clientHeight
-
-  context.clearRect(0, 0, width, height)
-
-  context.save()
-  context.strokeStyle = 'rgba(255, 255, 255, 0.08)'
-  context.lineWidth = 1
-
-  for (let x = 24; x < width; x += 24) {
-    context.beginPath()
-    context.moveTo(x, 0)
-    context.lineTo(x, height)
-    context.stroke()
-  }
-
-  for (let y = 24; y < height; y += 24) {
-    context.beginPath()
-    context.moveTo(0, y)
-    context.lineTo(width, y)
-    context.stroke()
-  }
-
-  const snapshot = state.snapshot
-
-  if (!snapshot) {
-    context.fillStyle = 'rgba(236, 247, 246, 0.72)'
-    context.font = '600 18px "Avenir Next", "Gill Sans", sans-serif'
-    context.textAlign = 'center'
-    context.fillText('Join a room to stream the server state.', width / 2, height / 2)
-    context.restore()
-    return
-  }
-
-  const scale = Math.min(width / snapshot.world.width, height / snapshot.world.height)
-  const offsetX = (width - snapshot.world.width * scale) / 2
-  const offsetY = (height - snapshot.world.height * scale) / 2
-
-  context.translate(offsetX, offsetY)
-  context.scale(scale, scale)
-
-  context.strokeStyle = 'rgba(255, 255, 255, 0.18)'
-  context.lineWidth = 4 / scale
-  context.strokeRect(0, 0, snapshot.world.width, snapshot.world.height)
-
-  for (const player of state.renderPlayers.values()) {
-    const isSelf = player.id === state.playerId
-
-    context.beginPath()
-    context.fillStyle = player.color
-    context.arc(player.x, player.y, snapshot.world.playerRadius, 0, Math.PI * 2)
-    context.fill()
-
-    if (isSelf) {
-      context.lineWidth = 4 / scale
-      context.strokeStyle = '#f8fafc'
-      context.stroke()
-    }
-
-    context.fillStyle = '#f8fafc'
-    context.font = `${16 / scale}px "Avenir Next", "Gill Sans", sans-serif`
-    context.textAlign = 'center'
-    context.fillText(player.nickname, player.x, player.y - 28)
-  }
-
-  context.restore()
-}
-
-function loop(frameAt) {
-  const deltaSeconds = Math.min((frameAt - state.lastFrameAt) / 1000, MAX_FRAME_SECONDS)
-  state.lastFrameAt = frameAt
-  stepSimulation(deltaSeconds)
-  renderWorld()
-  requestAnimationFrame(loop)
-}
-
-async function copyInviteLink() {
-  const inviteUrl = currentInviteUrl()
-
-  if (!inviteUrl) {
-    logHint('Create or join a room before copying an invite link.')
-    return
-  }
-
-  try {
-    await navigator.clipboard.writeText(inviteUrl)
-    logHint(`Invite link copied for room ${state.roomId}.`)
-  } catch {
-    inviteStatusElement.textContent = inviteUrl
-    logHint('Copy was blocked by the browser, so the invite link is shown in the panel.')
-  }
+  connectionBadge.dataset.state = state.connection
+  connectionBadge.textContent =
+    state.connection === 'online' ? 'Connected' : state.connection === 'offline' ? 'Reconnecting' : 'Connecting'
 }
 
 function send(message) {
-  if (!state.socket || state.socket.readyState !== WebSocket.OPEN) {
-    return
-  }
-
-  state.socket.send(stringifyMessage(message))
+  network.send(message)
 }
 
-function directionalInput() {
-  const rawInput = {
-    x: (state.input.right ? 1 : 0) - (state.input.left ? 1 : 0),
-    y: (state.input.down ? 1 : 0) - (state.input.up ? 1 : 0)
+function handleServerMessage(message) {
+  switch (message.type) {
+    case 'connection:welcome':
+      state.selfId = message.playerId
+      if (state.pendingRoomFromUrl) {
+        joinRoom(state.pendingRoomFromUrl)
+        state.pendingRoomFromUrl = null
+      }
+      break
+
+    case 'lobby:rooms':
+      state.roomList = message.rooms
+      break
+
+    case 'room:joined':
+      state.currentRoomId = message.roomId
+      state.notice = message.source === 'create' ? 'Room created. Invite allies or ready up.' : 'Joined the shrine party.'
+      updateUrlRoom(message.roomId)
+      break
+
+    case 'room:left':
+      state.currentRoomId = null
+      state.roomState = null
+      state.snapshot = null
+      state.notice = 'Left the room.'
+      updateUrlRoom(null)
+      break
+
+    case 'room:state':
+      state.roomState = message.room
+      state.currentRoomId = message.room.roomId
+      if (!state.selfId) {
+        state.selfId = message.selfId
+      }
+      if (!state.snapshot || currentPhase() === 'lobby') {
+        refreshAmbientNotice()
+      }
+      break
+
+    case 'game:snapshot':
+      state.snapshot = message
+      state.currentRoomId = message.roomId
+      refreshAmbientNotice()
+      break
+
+    case 'room:error':
+      state.notice = message.message
+      break
+
+    default:
+      break
   }
 
-  return normalizeInput(rawInput)
-}
-
-function sendInput(force = false) {
-  if (!state.connected || !state.roomId) {
-    return
-  }
-
-  const input = directionalInput()
-
-  if (inputsEqual(input, state.lastSentInput)) {
-    return
-  }
-
-  const pendingInput = {
-    sequence: state.inputSequence,
-    input,
-    sentAt: performance.now()
-  }
-
-  send({
-    type: 'player:input',
-    sequence: pendingInput.sequence,
-    input
-  })
-
-  state.pendingInputs.push(pendingInput)
-  state.lastSentInput = input
-  state.inputSequence += 1
-}
-
-function applyServerAcknowledgement(acknowledgedSequence) {
-  if (!Number.isInteger(acknowledgedSequence)) {
-    return
-  }
-
-  let lastAcknowledgedInput = state.lastAckedInput
-
-  for (const pendingInput of state.pendingInputs) {
-    if (pendingInput.sequence <= acknowledgedSequence) {
-      lastAcknowledgedInput = pendingInput.input
-    }
-  }
-
-  state.lastAckedInput = lastAcknowledgedInput
-  state.pendingInputs = state.pendingInputs.filter((pendingInput) => pendingInput.sequence > acknowledgedSequence)
-  state.lastSnapshotAt = performance.now()
-}
-
-function scheduleReconnect() {
-  if (state.reconnectTimeoutId) {
-    return
-  }
-
-  state.reconnectTimeoutId = window.setTimeout(() => {
-    state.reconnectTimeoutId = null
-    connect()
-  }, 1200)
-}
-
-function connect() {
-  if (state.socket && [WebSocket.CONNECTING, WebSocket.OPEN].includes(state.socket.readyState)) {
-    return
-  }
-
-  const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
-  const socket = new WebSocket(`${protocol}://${window.location.host}/ws`)
-
-  state.socket = socket
-  updateStatus()
-
-  socket.addEventListener('open', () => {
-    state.connected = true
-    updateStatus()
-    logHint('Connected. Create or join a room, then move with WASD or arrow keys.')
-
-    if (state.desiredRoomId) {
-      joinRoom(state.desiredRoomId)
-    }
-  })
-
-  socket.addEventListener('close', () => {
-    state.connected = false
-    updateStatus()
-    logHint('Connection dropped. Reconnecting automatically...')
-    scheduleReconnect()
-  })
-
-  socket.addEventListener('message', (event) => {
-    const parsed = parseServerMessage(event.data)
-
-    if (!parsed.ok) {
-      logHint(parsed.error)
-      return
-    }
-
-    const message = parsed.message
-
-    switch (message.type) {
-      case 'connection:welcome':
-        state.playerId = message.playerId
-        updateStatus()
-        return
-
-      case 'lobby:rooms':
-        state.rooms = message.rooms
-        renderRoomList()
-        return
-
-      case 'room:joined':
-        clearSimulationState()
-        state.roomId = message.roomId
-        state.desiredRoomId = message.roomId
-        syncRoomUrl(message.roomId)
-        updateStatus()
-        roomCodeInput.value = message.roomId
-        logHint(`Joined room ${message.roomId}.`)
-        sendInput(true)
-        return
-
-      case 'room:left':
-        state.roomId = null
-        state.desiredRoomId = null
-        state.room = null
-        clearSimulationState()
-        syncRoomUrl(null)
-        renderRoster()
-        updateStatus()
-        logHint('You left the room. Pick another or create a new one.')
-        return
-
-      case 'room:state':
-        state.room = message.room
-        state.roomId = message.room.roomId
-        syncRoomUrl(message.room.roomId)
-        renderRoster()
-        updateStatus()
-        return
-
-      case 'game:snapshot':
-        state.snapshot = message
-        syncRenderPlayers(message)
-        applyServerAcknowledgement(message.acknowledgedSequence)
-        tickStatusElement.textContent = String(message.tick)
-        return
-
-      case 'room:error':
-        logHint(message.message)
-        return
-
-      default:
-        return
-    }
-  })
+  renderStaticUi()
 }
 
 function createRoom() {
   saveNickname()
   send({
     type: 'lobby:create-room',
-    nickname: state.nickname
+    nickname: nickname()
   })
 }
 
-function joinRoom(explicitRoomId = roomCodeInput.value) {
-  saveNickname()
-  const roomId = normalizeRoomId(explicitRoomId)
+function joinRoom(roomId = roomCodeInput.value) {
+  const normalized = normalizeRoomId(roomId)
 
-  if (!roomId) {
-    logHint('Room codes use 4 clear characters, like AB23.')
+  if (!normalized) {
+    state.notice = 'Room codes are 4 characters.'
+    renderStaticUi()
     return
   }
 
-  state.desiredRoomId = roomId
-  roomCodeInput.value = roomId
-
+  saveNickname()
+  roomCodeInput.value = normalized
   send({
     type: 'lobby:join-room',
-    roomId,
-    nickname: state.nickname
+    roomId: normalized,
+    nickname: nickname()
+  })
+}
+
+function toggleReady() {
+  const self = state.roomState?.players.find((player) => player.id === state.selfId)
+  send({
+    type: 'player:ready',
+    ready: !self?.ready
   })
 }
 
 function leaveRoom() {
-  send({ type: 'lobby:leave-room' })
-}
-
-function toggleReady() {
   send({
-    type: 'player:ready',
-    ready: !currentReady()
+    type: 'lobby:leave-room'
   })
 }
 
-function handleKeyChange(key, pressed) {
-  if (key === 'ArrowLeft' || key.toLowerCase() === 'a') {
-    state.input.left = pressed
-  }
-
-  if (key === 'ArrowRight' || key.toLowerCase() === 'd') {
-    state.input.right = pressed
-  }
-
-  if (key === 'ArrowUp' || key.toLowerCase() === 'w') {
-    state.input.up = pressed
-  }
-
-  if (key === 'ArrowDown' || key.toLowerCase() === 's') {
-    state.input.down = pressed
-  }
-
-  sendInput(true)
+function chooseUpgrade(upgradeId) {
+  send({
+    type: 'player:upgrade',
+    upgradeId
+  })
 }
 
-createRoomButton.addEventListener('click', createRoom)
-joinRoomButton.addEventListener('click', () => joinRoom())
-leaveRoomButton.addEventListener('click', leaveRoom)
-toggleReadyButton.addEventListener('click', toggleReady)
-copyInviteButton.addEventListener('click', copyInviteLink)
-nicknameInput.addEventListener('change', saveNickname)
-roomCodeInput.addEventListener('input', () => {
-  roomCodeInput.value = roomCodeInput.value.toUpperCase()
-})
-roomCodeInput.addEventListener('keydown', (event) => {
-  if (event.key === 'Enter') {
-    joinRoom()
-  }
-})
+function readMovementVector() {
+  let x = 0
+  let y = 0
 
-window.addEventListener('keydown', (event) => {
-  if (event.repeat) {
+  if (state.keys.has('KeyA') || state.keys.has('ArrowLeft')) {
+    x -= 1
+  }
+  if (state.keys.has('KeyD') || state.keys.has('ArrowRight')) {
+    x += 1
+  }
+  if (state.keys.has('KeyW') || state.keys.has('ArrowUp')) {
+    y -= 1
+  }
+  if (state.keys.has('KeyS') || state.keys.has('ArrowDown')) {
+    y += 1
+  }
+
+  return normalizeInput({ x, y })
+}
+
+function sendInputFrame(now) {
+  if (!network.isOpen() || !state.currentRoomId) {
     return
   }
 
-  handleKeyChange(event.key, true)
-})
+  if (now - state.lastInputSendAt < 40) {
+    return
+  }
 
-window.addEventListener('keyup', (event) => {
-  handleKeyChange(event.key, false)
-})
+  state.lastInputSendAt = now
+  state.inputSequence += 1
+  send({
+    type: 'player:input',
+    sequence: state.inputSequence,
+    input: state.localInput.move,
+    aim: state.localInput.aim,
+    fire: state.localInput.fire,
+    dash: state.localInput.dash,
+    beacon: state.localInput.beacon,
+    nova: state.localInput.nova,
+    deploy: state.localInput.deploy
+  })
 
-window.addEventListener('resize', resizeCanvas)
-
-if (initialRoomId) {
-  logHint(`Invite link detected for room ${initialRoomId}. Connecting now...`)
+  state.localInput.dash = false
+  state.localInput.beacon = false
+  state.localInput.nova = false
+  state.localInput.deploy = false
 }
 
-resizeCanvas()
-renderRoomList()
-renderRoster()
-updateStatus()
-requestAnimationFrame(loop)
-connect()
+function renderSessionPanel() {
+  if (!sessionPanel) {
+    return
+  }
+
+  const room = state.roomState
+  const inRoom = Boolean(room)
+  const phase = currentPhase()
+
+  sessionPanel.innerHTML = `
+    <div class="panel-head">
+      <div>
+        <p class="eyebrow">Session</p>
+        <h2>${inRoom ? `Room ${room.roomId}` : 'Find a Room'}</h2>
+      </div>
+      ${inRoom ? `<span class="room-phase">${phase}</span>` : ''}
+    </div>
+
+    <div class="field-stack">
+      <label class="field">
+        <span>Warden Name</span>
+        <input id="nickname-proxy" value="${nicknameInput.value}" placeholder="Your name" />
+      </label>
+      <label class="field">
+        <span>Room Code</span>
+        <input id="room-proxy" value="${roomCodeInput.value}" placeholder="AB23" />
+      </label>
+    </div>
+
+    <div class="button-row">
+      <button class="action-button primary" data-action="create-room">Create Room</button>
+      <button class="action-button" data-action="join-room">Join</button>
+    </div>
+
+    ${
+      inRoom
+        ? `
+          <div class="room-card">
+            <div>
+              <p class="mini-label">Invite Link</p>
+              <strong>${inviteLink(room.roomId)}</strong>
+            </div>
+            <div class="button-row compact">
+              <button class="action-button" data-action="copy-invite">Copy Invite</button>
+              <button class="action-button ${phase === 'lobby' || phase === 'victory' || phase === 'defeat' ? 'primary' : ''}" data-action="toggle-ready">Ready</button>
+              <button class="action-button danger" data-action="leave-room">Leave</button>
+            </div>
+          </div>
+        `
+        : `
+          <div class="room-list">
+            ${state.roomList.length ? state.roomList.map(renderRoomListItem).join('') : '<div class="room-empty">No active rooms yet. Create the first shrine party.</div>'}
+          </div>
+        `
+    }
+  `
+
+  const nicknameProxy = sessionPanel.querySelector('#nickname-proxy')
+  const roomProxy = sessionPanel.querySelector('#room-proxy')
+
+  nicknameProxy?.addEventListener('change', (event) => {
+    nicknameInput.value = event.target.value
+    saveNickname()
+    renderStaticUi()
+  })
+
+  roomProxy?.addEventListener('change', (event) => {
+    roomCodeInput.value = event.target.value.toUpperCase()
+  })
+}
+
+function renderRoomListItem(room) {
+  return `
+    <button class="room-list-item" data-room-code="${room.roomId}">
+      <span>${room.roomId}</span>
+      <span>${room.playerCount}/${room.maxPlayers}</span>
+      <span>${room.phase}</span>
+    </button>
+  `
+}
+
+function renderRosterPanel() {
+  if (!rosterPanel) {
+    return
+  }
+
+  const players = state.snapshot?.players ?? state.roomState?.players ?? []
+
+  rosterPanel.innerHTML = `
+    <div class="panel-head">
+      <div>
+        <p class="eyebrow">Party</p>
+        <h2>${players.length ? `${players.length} Wardens` : 'No Wardens Yet'}</h2>
+      </div>
+    </div>
+    <div class="roster-list">
+      ${
+        players.length
+          ? players
+              .map(
+                (player) => `
+                  <div class="roster-card ${player.id === state.selfId ? 'is-self' : ''}">
+                    <div class="roster-row">
+                      <strong>${player.nickname}</strong>
+                      <span class="roster-tag">${player.alive === false ? 'Down' : player.ready ? 'Ready' : 'Here'}</span>
+                    </div>
+                    <div class="roster-meta">
+                      <span>Lv ${player.level ?? 1}</span>
+                      <span>${player.hp ?? '--'}/${player.maxHp ?? '--'} HP</span>
+                      <span>${player.score ?? 0} score</span>
+                    </div>
+                  </div>
+                `
+              )
+              .join('')
+          : '<div class="room-empty">Create or join a room to gather your party.</div>'
+      }
+    </div>
+  `
+}
+
+function renderInfoPanel() {
+  if (!infoPanel) {
+    return
+  }
+
+  const world = state.snapshot?.world
+  const players = state.snapshot?.players ?? state.roomState?.players ?? []
+  const self = currentPlayer()
+  const inspiration = `${GAME_META.inspiration} inspired`
+  const remainingSpawns = world?.wave?.remainingSpawns ?? 0
+  const alive = players.length ? `${livingPlayerCount(players)}/${players.length}` : '--'
+  const blessings = self?.upgrades?.length ?? 0
+  const spires = world?.defenses?.filter((defense) => defense.ownerId === state.selfId).length ?? 0
+
+  infoPanel.innerHTML = `
+    <div class="panel-head">
+      <div>
+        <p class="eyebrow">Run Brief</p>
+        <h2>${world?.wave?.name ?? GAME_META.title}</h2>
+      </div>
+    </div>
+
+    <div class="info-copy">
+      <p><strong>${GAME_META.genre}</strong> with a shared relic-defense objective and live co-op positioning.</p>
+      <p>${inspiration}: fast readable combat, short escalating runs, and blessing-driven progression.</p>
+      <p><strong>Unique twist:</strong> each warden drags a radiant tether back to the Sunshard relic or their beacon, burning enemies that cross it.</p>
+    </div>
+
+    <div class="info-stat-grid">
+      <div class="info-stat-card">
+        <span class="mini-label">Wardens Up</span>
+        <strong>${alive}</strong>
+      </div>
+      <div class="info-stat-card">
+        <span class="mini-label">Queued Spawns</span>
+        <strong>${remainingSpawns}</strong>
+      </div>
+      <div class="info-stat-card">
+        <span class="mini-label">Blessings</span>
+        <strong>${blessings}</strong>
+      </div>
+      <div class="info-stat-card">
+        <span class="mini-label">Sun Spires</span>
+        <strong>${spires}</strong>
+      </div>
+    </div>
+
+    <div class="info-block">
+      <p class="mini-label">Controls</p>
+      <div class="controls-grid">
+        <span>WASD / Arrows</span><span>Move</span>
+        <span>Mouse</span><span>Aim & fire</span>
+        <span>Space</span><span>Dash</span>
+        <span>E</span><span>Relay Beacon</span>
+        <span>Q</span><span>Star Nova</span>
+        <span>R</span><span>Sun Spire</span>
+        <span>1 / 2 / 3</span><span>Pick blessing</span>
+      </div>
+    </div>
+  `
+}
+
+function cooldownLabel(value, instant = false) {
+  if (instant) {
+    return value > 0 ? `${(value / 1000).toFixed(1)}s` : 'Ready'
+  }
+
+  return value > 0 ? `${Math.ceil(value / 100) / 10}s` : 'Ready'
+}
+
+function renderAbilityBar() {
+  if (!abilityBar) {
+    return
+  }
+
+  const self = currentPlayer()
+
+  abilityBar.innerHTML = ABILITIES.map((ability) => {
+    const cooldownValue = self?.[ability.cooldownField] ?? 0
+    const ratio = ability.cooldownField === 'fireCooldownMs' ? Math.min(1, cooldownValue / 350) : Math.min(1, cooldownValue / 10000)
+
+    return `
+      <div class="ability-card ${cooldownValue <= 0 ? 'is-ready' : ''}">
+        <div class="ability-top">
+          <span class="ability-key">${ability.key}</span>
+          <strong>${ability.name}</strong>
+        </div>
+        <p>${ability.description}</p>
+        <div class="cooldown-track"><div class="cooldown-fill" style="transform:scaleX(${1 - ratio})"></div></div>
+        <span class="ability-state">${cooldownLabel(cooldownValue, ability.instant)}</span>
+      </div>
+    `
+  }).join('')
+}
+
+function renderHudTop() {
+  if (!hudTop) {
+    return
+  }
+
+  const world = state.snapshot?.world
+  const self = currentPlayer()
+
+  hudTop.innerHTML = `
+    <div class="hud-card">
+      <span class="mini-label">Relic</span>
+      <strong>${world ? `${world.relic.hp}/${world.relic.maxHp}` : '--'}</strong>
+    </div>
+    <div class="hud-card">
+      <span class="mini-label">Wave</span>
+      <strong>${world ? `${world.wave.index}/${world.wave.total}` : '--'}</strong>
+    </div>
+    <div class="hud-card">
+      <span class="mini-label">Level</span>
+      <strong>${self?.level ?? 1}</strong>
+    </div>
+    <div class="hud-card">
+      <span class="mini-label">Motes</span>
+      <strong>${self?.motes ?? 0}</strong>
+    </div>
+    <div class="hud-card">
+      <span class="mini-label">Kills</span>
+      <strong>${world?.totals.kills ?? 0}</strong>
+    </div>
+  `
+}
+
+function renderUpgradeOverlay() {
+  if (!upgradeOverlay) {
+    return
+  }
+
+  const self = currentPlayer()
+  const choices = self?.upgradeChoices ?? []
+
+  if (!choices.length || state.snapshot?.world.phase !== 'intermission') {
+    upgradeOverlay.classList.add('hidden')
+    upgradeOverlay.innerHTML = ''
+    return
+  }
+
+  upgradeOverlay.classList.remove('hidden')
+  upgradeOverlay.innerHTML = `
+    <div class="upgrade-card-shell">
+      <p class="eyebrow">Blessing Draft</p>
+      <h2>Choose One Boon Before The Next Assault</h2>
+      <div class="upgrade-grid">
+        ${choices
+          .map((upgradeId, index) => {
+            const upgrade = UPGRADE_DEFS[upgradeId]
+            return `
+              <button class="upgrade-option rarity-${upgrade.rarity}" data-upgrade-id="${upgradeId}">
+                <span class="upgrade-index">${index + 1}</span>
+                <strong>${upgrade.name}</strong>
+                <span class="upgrade-rarity">${upgrade.rarity}</span>
+                <p>${upgrade.description}</p>
+              </button>
+            `
+          })
+          .join('')}
+      </div>
+    </div>
+  `
+}
+
+function renderPhaseOverlay() {
+  if (!phaseOverlay) {
+    return
+  }
+
+  const world = state.snapshot?.world
+  const phase = world?.phase ?? currentPhase()
+  const inRoom = Boolean(state.currentRoomId)
+
+  if (!inRoom) {
+    phaseOverlay.classList.remove('hidden')
+    phaseOverlay.innerHTML = `
+      <div class="phase-card">
+        <p class="eyebrow">Multiplayer Shrine</p>
+        <h2>${GAME_META.title}</h2>
+        <p>Create a room, invite friends, or start a solo run while the rest of the party is offline.</p>
+      </div>
+    `
+    return
+  }
+
+  if (phase === 'countdown') {
+    phaseOverlay.classList.remove('hidden')
+    phaseOverlay.innerHTML = `
+      <div class="phase-card">
+        <p class="eyebrow">Run Starting</p>
+        <h2>${Math.max(1, Math.ceil((world?.countdownMs ?? 1000) / 1000))}</h2>
+        <p>${world?.eventText ?? 'The shrine awakens...'}</p>
+      </div>
+    `
+    return
+  }
+
+  if (phase === 'victory' || phase === 'defeat') {
+    phaseOverlay.classList.remove('hidden')
+    phaseOverlay.innerHTML = `
+      <div class="phase-card">
+        <p class="eyebrow">${phase === 'victory' ? 'Victory' : 'Defeat'}</p>
+        <h2>${world?.eventText ?? ''}</h2>
+        <p>When everyone is ready again, the next run will begin from wave one.</p>
+      </div>
+    `
+    return
+  }
+
+  phaseOverlay.classList.add('hidden')
+  phaseOverlay.innerHTML = ''
+}
+
+function renderStaticUi() {
+  setConnectionBadge()
+
+  if (statusLine) {
+    statusLine.textContent = state.notice
+  }
+
+  renderSessionPanel()
+  renderRosterPanel()
+  renderInfoPanel()
+  renderHudTop()
+  renderAbilityBar()
+  renderUpgradeOverlay()
+  renderPhaseOverlay()
+}
+
+function syncPointerAim(clientX, clientY) {
+  const self = currentPlayer()
+
+  if (!self) {
+    return
+  }
+
+  const pointer = renderer.screenToWorld(clientX, clientY)
+  state.localInput.aim = normalizeInput({
+    x: pointer.x - self.x,
+    y: pointer.y - self.y
+  })
+}
+
+function bindStaticEvents() {
+  if (nicknameInput) {
+    nicknameInput.value = localStorage.getItem(NICKNAME_KEY) || 'Warden'
+  }
+
+  nicknameInput?.addEventListener('change', () => {
+    saveNickname()
+    renderStaticUi()
+  })
+
+  roomCodeInput?.addEventListener('change', () => {
+    roomCodeInput.value = roomCodeInput.value.toUpperCase()
+  })
+
+  createRoomButton?.addEventListener('click', createRoom)
+  joinRoomButton?.addEventListener('click', () => joinRoom())
+  readyButton?.addEventListener('click', toggleReady)
+  leaveRoomButton?.addEventListener('click', leaveRoom)
+  copyInviteButton?.addEventListener('click', async () => {
+    if (!state.currentRoomId) {
+      return
+    }
+
+    await navigator.clipboard.writeText(inviteLink(state.currentRoomId))
+    state.notice = 'Invite link copied.'
+    renderStaticUi()
+  })
+
+  sessionPanel?.addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-action], [data-room-code]')
+
+    if (!button) {
+      return
+    }
+
+    if (button.dataset.roomCode) {
+      joinRoom(button.dataset.roomCode)
+      return
+    }
+
+    switch (button.dataset.action) {
+      case 'create-room':
+        createRoom()
+        return
+      case 'join-room':
+        joinRoom(sessionPanel.querySelector('#room-proxy')?.value ?? roomCodeInput.value)
+        return
+      case 'copy-invite':
+        if (state.currentRoomId) {
+          await navigator.clipboard.writeText(inviteLink(state.currentRoomId))
+          state.notice = 'Invite link copied.'
+          renderStaticUi()
+        }
+        return
+      case 'toggle-ready':
+        toggleReady()
+        return
+      case 'leave-room':
+        leaveRoom()
+        return
+      default:
+        return
+    }
+  })
+
+  upgradeOverlay?.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-upgrade-id]')
+
+    if (!button) {
+      return
+    }
+
+    chooseUpgrade(button.dataset.upgradeId)
+  })
+
+  window.addEventListener('keydown', (event) => {
+    if (event.repeat) {
+      return
+    }
+
+    if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(event.code)) {
+      event.preventDefault()
+    }
+
+    state.keys.add(event.code)
+
+    if (event.code === 'Space') {
+      state.localInput.dash = true
+    } else if (event.code === 'KeyE') {
+      state.localInput.beacon = true
+    } else if (event.code === 'KeyQ') {
+      state.localInput.nova = true
+    } else if (event.code === 'KeyR') {
+      state.localInput.deploy = true
+    } else if (event.code === 'Digit1' || event.code === 'Digit2' || event.code === 'Digit3') {
+      const choiceIndex = Number(event.code.replace('Digit', '')) - 1
+      const choice = currentPlayer()?.upgradeChoices?.[choiceIndex]
+      if (choice) {
+        chooseUpgrade(choice)
+      }
+    } else if (event.code === 'Enter' && state.currentRoomId) {
+      toggleReady()
+    }
+
+    state.localInput.move = readMovementVector()
+  })
+
+  window.addEventListener('keyup', (event) => {
+    state.keys.delete(event.code)
+
+    state.localInput.move = readMovementVector()
+  })
+
+  canvas?.addEventListener('pointermove', (event) => {
+    syncPointerAim(event.clientX, event.clientY)
+  })
+
+  canvas?.addEventListener('pointerdown', (event) => {
+    state.localInput.fire = true
+    syncPointerAim(event.clientX, event.clientY)
+  })
+
+  window.addEventListener('pointerup', () => {
+    state.localInput.fire = false
+  })
+}
+
+function animationFrame(now) {
+  sendInputFrame(now)
+  renderer.render(state.snapshot, { selfId: state.selfId })
+  requestAnimationFrame(animationFrame)
+}
+
+const resizeObserver = new ResizeObserver(() => {
+  renderer.resize()
+  renderStaticUi()
+})
+
+bindStaticEvents()
+renderer.resize()
+resizeObserver.observe(canvas)
+renderStaticUi()
+network.connect()
+requestAnimationFrame(animationFrame)

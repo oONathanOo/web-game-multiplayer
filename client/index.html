@@ -3,105 +3,54 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Multiplayer Sandbox</title>
+    <title>Sunshard Siege</title>
     <link rel="stylesheet" href="/client/styles.css" />
   </head>
   <body>
-    <main class="app-shell">
-      <aside class="control-panel">
-        <div class="panel-card brand-card">
-          <p class="eyebrow">Multiplayer Starter</p>
-          <h1>Authoritative Sandbox</h1>
-          <p class="lede">
-            Rooms, realtime sync, fixed-tick simulation, and input handling are ready before we lock in the
-            actual game.
-          </p>
+    <header class="topbar">
+      <div class="brand-block">
+        <p class="eyebrow">Multiplayer Action Roguelite</p>
+        <h1>Sunshard Siege</h1>
+        <p class="brand-copy">Defend the relic, chain enemies with radiant tethers, and draft blessings between waves.</p>
+      </div>
+
+      <div class="topbar-actions">
+        <label class="field inline-field">
+          <span>Warden</span>
+          <input id="nickname-input" maxlength="18" placeholder="Your name" />
+        </label>
+        <label class="field inline-field">
+          <span>Room</span>
+          <input id="room-code-input" maxlength="4" placeholder="AB23" />
+        </label>
+        <div class="button-row top-buttons">
+          <button id="create-room-button" class="action-button primary">Create</button>
+          <button id="join-room-button" class="action-button">Join</button>
+          <button id="ready-button" class="action-button">Ready</button>
+          <button id="leave-room-button" class="action-button danger">Leave</button>
+          <button id="copy-invite-button" class="action-button">Copy Invite</button>
         </div>
-
-        <div class="panel-card">
-          <label class="field">
-            <span>Nickname</span>
-            <input id="nickname" maxlength="18" placeholder="Pilot name" />
-          </label>
-
-          <div class="button-row">
-            <button id="create-room" class="primary">Create Room</button>
-            <button id="leave-room" class="ghost">Leave</button>
-          </div>
-
-          <label class="field">
-            <span>Room Code</span>
-            <input id="room-code" maxlength="4" placeholder="ABCD" />
-          </label>
-
-          <div class="button-row">
-            <button id="join-room" class="secondary">Join Room</button>
-            <button id="toggle-ready" class="ghost">Toggle Ready</button>
-          </div>
-
-          <div class="invite-block">
-            <div id="invite-status" class="invite-status">Join or create a room to generate an invite link.</div>
-            <button id="copy-invite" class="primary invite-button">Copy Invite Link</button>
-          </div>
+        <div class="topbar-status">
+          <span id="connection-badge" class="connection-badge" data-state="connecting">Connecting</span>
+          <span id="status-line" class="status-line"></span>
         </div>
+      </div>
+    </header>
 
-        <div class="panel-card">
-          <div class="section-head">
-            <h2>Open Rooms</h2>
-            <span id="room-count" class="pill">0</span>
-          </div>
-          <div id="room-list" class="room-list empty-state">No rooms yet. Create the first one.</div>
-        </div>
-
-        <div class="panel-card">
-          <div class="section-head">
-            <h2>Roster</h2>
-            <span id="current-room-label" class="pill neutral">No Room</span>
-          </div>
-          <div id="roster" class="roster empty-state">Join a room to see connected players.</div>
-        </div>
-      </aside>
-
-      <section class="stage-panel">
-        <div class="panel-card stage-header">
-          <div>
-            <p class="eyebrow">Live State</p>
-            <h2>Realtime Arena Preview</h2>
-          </div>
-
-          <div class="status-cluster">
-            <div class="status-chip">
-              <span>Connection</span>
-              <strong id="connection-status">Connecting</strong>
-            </div>
-            <div class="status-chip">
-              <span>Tick</span>
-              <strong id="tick-status">0</strong>
-            </div>
-            <div class="status-chip">
-              <span>Player</span>
-              <strong id="player-status">Pending</strong>
-            </div>
-          </div>
-        </div>
-
-        <div class="panel-card canvas-card">
-          <canvas id="world"></canvas>
-          <div class="canvas-overlay">
-            <p id="hint-text">Use WASD or arrow keys after joining a room.</p>
-          </div>
-        </div>
-
-        <div class="panel-card tips-card">
-          <p class="eyebrow">What’s Ready</p>
-          <ul class="tips-list">
-            <li>Shared message protocol between browser and server</li>
-            <li>Room codes and lobby discovery</li>
-            <li>Authoritative movement and server snapshots</li>
-            <li>Ready flags for future pre-match flow</li>
-          </ul>
-        </div>
+    <main class="layout">
+      <section class="stage-card">
+        <canvas id="game-canvas"></canvas>
+        <div id="hud-top" class="hud-top"></div>
+        <div id="phase-overlay" class="phase-overlay"></div>
+        <div id="upgrade-overlay" class="upgrade-overlay hidden"></div>
+        <div id="ability-bar" class="ability-bar"></div>
       </section>
+
+      <aside class="sidebar">
+        <section id="session-panel" class="panel"></section>
+        <section id="roster-panel" class="panel"></section>
+        <section id="info-panel" class="panel"></section>
+      </aside>
     </main>
 
     <script type="module" src="/client/main.js"></script>

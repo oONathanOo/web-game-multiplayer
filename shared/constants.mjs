@@ -9,7 +9,7 @@ export const MAX_PLAYERS_PER_ROOM = 8
 export const ROOM_ID_LENGTH = 4
 export const ROOM_ID_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
 export const MAX_MESSAGE_BYTES = 8 * 1024
-export const DEFAULT_NICKNAME = 'Pilot'
+export const DEFAULT_NICKNAME = 'Warden'
 export const PLAYER_COLORS = [
   '#0f766e',
   '#ef4444',

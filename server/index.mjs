@@ -7,7 +7,7 @@ const gameServer = createGameServer({ port, host })
 async function main() {
   const address = await gameServer.start()
   const displayHost = host === '0.0.0.0' ? 'localhost' : host
-  console.log(`Multiplayer starter listening on http://${displayHost}:${address.port}`)
+  console.log(`Sunshard Siege listening on http://${displayHost}:${address.port}`)
 }
 
 main().catch((error) => {

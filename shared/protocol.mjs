@@ -48,6 +48,16 @@ export function normalizeInput(value) {
   }
 }
 
+export function normalizeAim(value) {
+  const normalized = normalizeInput(value)
+
+  if (normalized.x === 0 && normalized.y === 0) {
+    return { x: 1, y: 0 }
+  }
+
+  return normalized
+}
+
 export function createRoomId(randomValue = Math.random) {
   let roomId = ''
 
@@ -165,7 +175,24 @@ export function parseClientMessage(raw) {
         message: {
           type: message.type,
           sequence: Number.isInteger(message.sequence) && message.sequence >= 0 ? message.sequence : 0,
-          input: normalizeInput(message.input)
+          input: {
+            move: normalizeInput(message.input),
+            aim: normalizeAim(message.aim),
+            fire: Boolean(message.fire),
+            dash: Boolean(message.dash),
+            beacon: Boolean(message.beacon),
+            nova: Boolean(message.nova),
+            deploy: Boolean(message.deploy)
+          }
+        }
+      }
+
+    case 'player:upgrade':
+      return {
+        ok: true,
+        message: {
+          type: message.type,
+          upgradeId: typeof message.upgradeId === 'string' ? message.upgradeId.trim() : ''
         }
       }
 

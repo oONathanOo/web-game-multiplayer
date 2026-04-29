@@ -284,6 +284,20 @@ export function createGameServer(options = {}) {
         roomManager.updatePlayerInput(playerId, message.sequence, message.input)
         return
 
+      case 'player:upgrade': {
+        const changed = roomManager.selectUpgrade(playerId, message.upgradeId)
+
+        if (!changed) {
+          sendToPlayer(playerId, {
+            type: 'room:error',
+            code: 'invalid_upgrade',
+            message: 'That blessing can not be chosen right now.'
+          })
+        }
+
+        return
+      }
+
       default:
         return
     }
@@ -313,7 +327,7 @@ export function createGameServer(options = {}) {
 
     connections.set(playerId, {
       id: playerId,
-      nickname: `Pilot ${playerId.slice(0, 4)}`,
+      nickname: `Warden ${playerId.slice(0, 4)}`,
       socket: websocket
     })
 
